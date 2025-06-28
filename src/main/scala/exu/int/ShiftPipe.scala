@@ -120,7 +120,7 @@ class ShiftArray(dLenB: Int) extends Module {
     }
   }
 
-  val scaling_array = Module(new AdderArray(dLenB))
+  val scaling_array = Module(new AdderArray(dLenB, no_rm=true))
   scaling_array.io.in1    := shifted
   scaling_array.io.in2.foreach(_ := 0.U)
   scaling_array.io.incr   := Mux(scaling_pipe, rounding_incrs, VecInit.fill(dLenB)(false.B))

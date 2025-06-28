@@ -9,43 +9,44 @@ import freechips.rocketchip.tile._
 import saturn.common._
 import saturn.insns._
 
-class AdderArray(dLenB: Int) extends Module {
+class AdderArray(dLenB: Int, maxSizeB: Int = 8, bSize: Int = 8, start_eew: Int = 0, no_rm: Boolean = false, no_incr: Boolean = false) extends Module {
+  val levels = log2Ceil(maxSizeB) + 1
   val io = IO(new Bundle {
-    val in1 = Input(Vec(dLenB, UInt(8.W)))
-    val in2 = Input(Vec(dLenB, UInt(8.W)))
+    val in1 = Input(Vec(dLenB, UInt(bSize.W)))
+    val in2 = Input(Vec(dLenB, UInt(bSize.W)))
     val incr = Input(Vec(dLenB, Bool()))
     val mask_carry = Input(UInt(dLenB.W))
 
     val signed    = Input(Bool())
-    val eew       = Input(UInt(2.W))
+    val eew       = Input(UInt(log2Ceil(levels + start_eew).W))
     val avg       = Input(Bool())
     val rm        = Input(UInt(2.W))
     val sub       = Input(Bool())
     val cmask     = Input(Bool())
 
-    val out   = Output(Vec(dLenB, UInt(8.W)))
+    val out   = Output(Vec(dLenB, UInt(bSize.W)))
     val carry = Output(Vec(dLenB, Bool()))
   })
 
-  val use_carry = VecInit.tabulate(4)({ eew =>
+  val use_carry = VecInit.tabulate(levels)({ eew =>
     Fill(dLenB >> eew, ~(1.U((1 << eew).W)))
-  })(io.eew)
-  val carry_clear = Mux(io.avg, use_carry.asBools.map(Cat(~(0.U(8.W)), _)).asUInt, ~(0.U(73.W)))
-  val carry_restore = Mux(io.avg, use_carry.asBools.map(Cat(0.U(8.W), _)).asUInt, 0.U(73.W))
+  })(io.eew - start_eew.U)
+  val carry_clear = Mux(io.avg, use_carry.asBools.map(Cat(~(0.U(bSize.W)), _)).asUInt, ~(0.U((dLenB * (bSize + 1) + 1).W)))
+  val carry_restore = Mux(io.avg, use_carry.asBools.map(Cat(0.U(bSize.W), _)).asUInt, 0.U((dLenB * (bSize + 1) + 1).W))
 
-  val avg_in1 = VecInit.tabulate(4) { eew =>
-    VecInit(io.in1.asTypeOf(Vec(dLenB >> eew, UInt((8 << eew).W))).map(e => Cat(io.signed && e((8<<eew)-1), e) >> 1)).asUInt
-  }(io.eew).asTypeOf(Vec(dLenB, UInt(8.W)))
-  val avg_in2 = VecInit.tabulate(4) { eew =>
-    VecInit(io.in2.asTypeOf(Vec(dLenB >> eew, UInt((8 << eew).W))).map(e => Cat(io.signed && e((8<<eew)-1), e) >> 1)).asUInt
-  }(io.eew).asTypeOf(Vec(dLenB, UInt(8.W)))
+  val avg_in1 = VecInit.tabulate(levels) { eew =>
+    VecInit(io.in1.asTypeOf(Vec(dLenB >> eew, UInt((bSize << eew).W))).map(e => Cat(io.signed && e((bSize<<eew)-1), e) >> 1)).asUInt
+  }(io.eew - start_eew.U).asTypeOf(Vec(dLenB, UInt(bSize.W)))
+  val avg_in2 = VecInit.tabulate(levels) { eew =>
+    VecInit(io.in2.asTypeOf(Vec(dLenB >> eew, UInt((bSize << eew).W))).map(e => Cat(io.signed && e((bSize<<eew)-1), e) >> 1)).asUInt
+  }(io.eew - start_eew.U).asTypeOf(Vec(dLenB, UInt(bSize.W)))
 
   val in1 = Mux(io.avg, avg_in1, io.in1)
   val in2 = Mux(io.avg, avg_in2, io.in2)
 
-  for (i <- 0 until (dLenB >> 3)) {
-    val h = (i+1)*8-1
-    val l = i*8
+  for (i <- 0 until (dLenB / maxSizeB)) {
+    val h = (i+1)*maxSizeB-1
+    val l = i*maxSizeB
     val io_in1_slice = io.in1.slice(l,h+1)
     val io_in2_slice = io.in2.slice(l,h+1)
     val in1_slice = in1.slice(l,h+1)
@@ -70,25 +71,26 @@ class AdderArray(dLenB: Int) extends Module {
         val bit = (!io.cmask & io.sub) | (io.cmask & (io.sub ^ mask_bit))
         Mux(carry, 0.U(1.W), Mux(io.avg, avg_bit, bit))
       }})
-    val round_incrs = (io_in1_slice
+    
+    val round_incrs = if (no_rm) 0.U else (io_in1_slice
       .zip(io_in2_slice)
       .zipWithIndex.map { case((l, r), i) => {
         val sum = r(1,0) +& ((l(1,0) ^ Fill(2, io.sub)) +& io.sub)
-        Cat(0.U(7.W), Cat(Mux(io.avg, RoundingIncrement(io.rm, sum(1), sum(0), None) & !use_carry_slice(i), 0.U), 0.U(1.W)))
+        Cat(0.U((bSize-1).W), Cat(Mux(io.avg, RoundingIncrement(io.rm, sum(1), sum(0), None) & !use_carry_slice(i), 0.U), 0.U(1.W)))
       }}
       .asUInt)
 
 
-    val in1_constructed = in1_slice.zip(in1_dummy_bits).map { case(i1, dummy_bit) => (i1 ^ Fill(8, io.sub)) ## dummy_bit }.asUInt
+    val in1_constructed = in1_slice.zip(in1_dummy_bits).map { case(i1, dummy_bit) => (i1 ^ Fill(bSize, io.sub)) ## dummy_bit }.asUInt
     val in2_constructed = in2_slice.zip(in2_dummy_bits).map { case(i2, dummy_bit) => i2 ## dummy_bit }.asUInt
 
-    val incr_constructed = incr_slice.zip(use_carry_slice).map { case(incr, masking) => Cat(0.U(7.W), Cat(Mux(!masking, incr, 0.U(1.W)), 0.U(1.W))) }.asUInt
+    val incr_constructed = if (no_incr) 0.U else incr_slice.zip(use_carry_slice).map { case(incr, masking) => Cat(0.U((bSize-1).W), Cat(Mux(!masking, incr, 0.U(1.W)), 0.U(1.W))) }.asUInt
 
     val sum = (((in1_constructed +& in2_constructed) & carry_clear) | carry_restore) +& round_incrs +& incr_constructed
 
-    for (j <- 0 until 8) {
-      io.out((i*8) + j) := sum(((j+1)*9)-1, (j*9) + 1)
-      io.carry((i*8) + j) := sum((j+1)*9)
+    for (j <- 0 until maxSizeB) {
+      io.out((i*maxSizeB) + j) := sum(((j+1)*(bSize+1))-1, (j*(bSize+1)) + 1)
+      io.carry((i*maxSizeB) + j) := sum((j+1)*(bSize+1))
     }
   }
 }
@@ -172,6 +174,147 @@ class SaturatedSumArray(dLenB: Int) extends Module {
   val clip = Mux(io.signed, signed_clip, unsigned_clip)
   io.out := io.sum.zipWithIndex.map { case (o,i) => Mux(mask(i), clip(i), o) }
   io.set_vxsat := mask
+}
+
+class MultiplierArray(dLenB: Int, bSize: Int = 8, signed: Boolean = true, start_eew: Int = 0) extends Module {
+  val levels = log2Ceil(dLenB) + 1
+  val dLen = dLenB * bSize
+  val io = IO(new Bundle {
+    val in1_signed = Input(Bool())
+    val in2_signed = Input(Bool())
+
+    val in1 = Input(Vec(dLenB, UInt(bSize.W)))
+    val in2 = Input(Vec(dLenB, UInt(bSize.W)))
+
+    val eew = Input(UInt(log2Ceil(levels + start_eew).W))
+
+    val out = Output(Vec(dLenB, UInt((bSize*2).W)))
+  })
+
+  val in1_negative = Wire(Vec(dLenB, Bool()))
+  val in2_negative = Wire(Vec(dLenB, Bool()))
+  in1_negative := DontCare
+  in2_negative := DontCare
+
+  val segments1 = Wire(Vec(dLenB, UInt(bSize.W)))
+  val segments2 = Wire(Vec(dLenB, UInt(bSize.W)))
+
+  val negation_cin = VecInit.tabulate(levels)({ eew =>
+    Fill(dLenB >> eew, 1.U(((1 << eew) * bSize).W))
+  })(io.eew - start_eew.U).asTypeOf(Vec(dLenB, UInt(bSize.W)))
+
+  Seq(
+    (io.in1_signed, io.in1, segments1, in1_negative),
+    (io.in2_signed, io.in2, segments2, in2_negative)
+  ).foreach { case (in_signed, in, out, negative) => {
+    if (signed) {
+      negative.zipWithIndex.foreach { case (e, i) => e := in_signed && in(i)(bSize - 1) }
+      
+      val negator = Module(new AdderArray(dLenB, bSize=bSize, start_eew=start_eew, no_rm=true, no_incr=true))
+      negator.io.in1 := in.map(~_)
+      negator.io.in2 := negation_cin
+      negator.io.incr := DontCare
+      negator.io.mask_carry := 0.U
+      negator.io.signed := DontCare
+      negator.io.eew := io.eew
+      negator.io.avg := false.B
+      negator.io.rm := DontCare
+      negator.io.sub := false.B
+      negator.io.cmask := false.B
+
+      out.zipWithIndex.foreach { case (e, i) =>
+        e := DontCare
+        for (l <- 0 until levels) {
+          when (io.eew === (l + start_eew).U) {
+            e := Mux(negative(i | ((1 << l) - 1)), negator.io.out(i), in(i))
+          }
+        }
+      }
+    } else {
+      out := in
+    }
+  }}
+
+  val partial_single = Wire(Vec(dLenB, UInt((bSize*2).W)))
+  for (i <- 0 until dLenB) {
+    partial_single(i) := segments1(i) * segments2(i)
+  }
+
+  val partial_double = Wire(Vec(dLenB, Vec(dLenB-1, UInt((bSize*2+2).W))))
+  for (i <- 0 until dLenB) {
+    for (j <- 0 until i) {
+      val sum1 = segments1(i) +& segments1(j)
+      val sum2 = segments2(i) +& segments2(j)
+      partial_double(i)(j) := sum1 * sum2
+    }
+    for (j <- i until (dLenB - 1)) {
+      partial_double(i)(j) := DontCare
+    }
+  }
+
+  val output_levels = (0 until levels).map(i => Wire(Vec(dLenB / (1 << i), UInt((bSize * (1 << i) * 2).W))))
+
+  for (i <- 0 until dLenB) {
+    output_levels(0)(i) := partial_single(i)
+  }
+  for (l <- 1 until levels) {
+    val elements_count = 1 << l
+    val result_width = bSize * elements_count * 2
+    for (i <- 0 until (1 << (levels - l - 1))) {
+      output_levels(l)(i) := ((elements_count / 2 until elements_count).map(a =>
+        (0 until elements_count / 2).map(b => Seq(
+          ~(partial_single(a + i * elements_count) << ((a + b) * bSize)).asTypeOf(UInt(result_width.W)),
+          ~(partial_single(b + i * elements_count) << ((a + b) * bSize)).asTypeOf(UInt(result_width.W)),
+          partial_double(a + i * elements_count)(b + i * elements_count) << ((a + b) * bSize)
+        )).flatten
+      ).flatten ++ Seq(
+        output_levels(l - 1)(i * 2),
+        output_levels(l - 1)(i * 2 + 1) << (result_width / 2),
+        (elements_count * elements_count / 2).U
+      )).foldLeft(0.U) { (acc, e) =>
+        acc +& e
+      }
+    }
+  }
+
+  val unsigned_out = Wire(Vec(dLenB, UInt((bSize*2).W)))
+
+  unsigned_out := DontCare
+  for (i <- 0 until levels) {
+    when (io.eew === (i + start_eew).U) {
+      unsigned_out := output_levels(i).asTypeOf(Vec(dLenB, UInt((bSize*2).W)))
+    }
+  }
+
+  val negation_cin_out = VecInit.tabulate(levels)({ eew =>
+    Fill(dLenB >> eew, 1.U(((1 << eew) * bSize * 2).W))
+  })(io.eew - start_eew.U).asTypeOf(Vec(dLenB, UInt((bSize*2).W)))
+
+  if (signed) {
+    val negative_out = in1_negative.zip(in2_negative).map { case (a, b) => a ^ b }
+    val negator = Module(new AdderArray(dLenB, bSize=bSize*2, start_eew=start_eew, no_rm=true, no_incr=true))
+    negator.io.in1 := unsigned_out.map(~_)
+    negator.io.in2 := negation_cin_out
+    negator.io.incr := DontCare
+    negator.io.mask_carry := 0.U
+    negator.io.signed := DontCare
+    negator.io.eew := io.eew
+    negator.io.avg := false.B
+    negator.io.rm := DontCare
+    negator.io.sub := false.B
+    negator.io.cmask := false.B
+
+    io.out.zipWithIndex.foreach { case (e, i) =>
+      e := DontCare
+      for (l <- 0 until levels) {
+        when (io.eew === (l + start_eew).U) {
+          e := Mux(negative_out(i | ((1 << l) - 1)), negator.io.out(i), unsigned_out(i))
+        }
+      }
+    }
+  } else {
+    io.out := unsigned_out
+  }
 }
 
 case object IntegerPipeFactory extends FunctionalUnitFactory {
@@ -261,10 +404,10 @@ class IntegerPipe(implicit p: Parameters) extends PipelinedFunctionalUnit(2)(p) 
     Fill(1 << eew, VecInit(add_carry.grouped(1 << eew).map(_.last).toSeq).asUInt)
   })(rvs1_eew)
 
-  val adder_arr = Module(new AdderArray(dLenB))
+  val adder_arr = Module(new AdderArray(dLenB, no_incr=true))
   adder_arr.io.in1 := Mux(rvs1_eew < vd_eew, narrow_vs1, in1_bytes)
   adder_arr.io.in2 := Mux(rvs2_eew < vd_eew, narrow_vs2, in2_bytes)
-  adder_arr.io.incr.foreach(_ := false.B)
+  adder_arr.io.incr := DontCare
   adder_arr.io.avg := ctrl.bool(Averaging)
   adder_arr.io.eew := vd_eew
   adder_arr.io.rm  := io.pipe(0).bits.vxrm

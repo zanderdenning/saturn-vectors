@@ -10,7 +10,7 @@ import saturn.common._
 import saturn.insns._
 
 
-class TandemFMAPipe(depth: Int, buildFP64: Boolean)(implicit p: Parameters) extends FPUModule()(p) {
+class TandemFMAPipe(depth: Int, buildFP64: Boolean, segmented: Boolean)(implicit p: Parameters) extends FPUModule()(p) {
   require (depth >= 4)
   val io = IO(new Bundle {
     val valid = Input(Bool())
@@ -86,31 +86,156 @@ class TandemFMAPipe(depth: Int, buildFP64: Boolean)(implicit p: Parameters) exte
   io.out := DontCare
   io.exc := DontCare
 
-  (buildFP64.option((dfma_valid, FType.D, da_in, db_in, dc_in)) ++ Seq(
-    (sfma_valid, FType.S, sa_in, sb_in, sc_in),
-    (hfma_valid, FType.H, ha_in, hb_in, hc_in)
-  )).foreach { case (fma_valid, ftype, a, b, c) => {
-    val n = 64 / ftype.ieeeWidth
-    val s1_valid = RegNext(fma_valid, false.B)
-    val res = (0 until n).map { i =>
-      val fma = Module(new MulAddRecFNPipe(depth-2, ftype.exp, ftype.sig))
-      fma.io.validin      := s1_valid
-      fma.io.op           := Mux(s1_valid, s1_op, 0.U)
-      fma.io.roundingMode := Mux(s1_valid, s1_frm, 0.U)
-      fma.io.detectTininess := hardfloat.consts.tininess_afterRounding
-      fma.io.a := RegEnable(a(i), fma_valid)
-      fma.io.b := RegEnable(Mux(io.addsub, 1.U << (ftype.ieeeWidth - 1), b(i)), fma_valid)
-      fma.io.c := RegEnable(Mux(io.mul, (a(i) ^ b(i)) & (1.U << ftype.ieeeWidth), c(i)), fma_valid)
+  if (!segmented) {
+    (buildFP64.option((dfma_valid, FType.D, da_in, db_in, dc_in)) ++ Seq(
+      (sfma_valid, FType.S, sa_in, sb_in, sc_in),
+      (hfma_valid, FType.H, ha_in, hb_in, hc_in)
+    )).foreach { case (fma_valid, ftype, a, b, c) => {
+      val n = 64 / ftype.ieeeWidth
+      val s1_valid = RegNext(fma_valid, false.B)
+      val res = (0 until n).map { i =>
+        val fma = Module(new MulAddRecFNPipe(depth-2, ftype.exp, ftype.sig))
+        fma.io.validin      := s1_valid
+        fma.io.op           := Mux(s1_valid, s1_op, 0.U)
+        fma.io.roundingMode := Mux(s1_valid, s1_frm, 0.U)
+        fma.io.detectTininess := hardfloat.consts.tininess_afterRounding
+        fma.io.a := RegEnable(a(i), fma_valid)
+        fma.io.b := RegEnable(Mux(io.addsub, 1.U << (ftype.ieeeWidth - 1), b(i)), fma_valid)
+        fma.io.c := RegEnable(Mux(io.mul, (a(i) ^ b(i)) & (1.U << ftype.ieeeWidth), c(i)), fma_valid)
 
-      val out = Pipe(fma.io.validout, ftype.ieee(fma.io.out), depth-4).bits
-      val exc = Pipe(fma.io.validout, fma.io.exceptionFlags, depth-4).bits
-      (out, Seq.fill(ftype.ieeeWidth / 8)(exc))
+        val out = Pipe(fma.io.validout, ftype.ieee(fma.io.out), depth-4).bits
+        val exc = Pipe(fma.io.validout, fma.io.exceptionFlags, depth-4).bits
+        (out, Seq.fill(ftype.ieeeWidth / 8)(exc))
+      }
+      when (out_eew_pipe.bits === log2Ceil(ftype.ieeeWidth >> 3).U) {
+        io.out := res.map(_._1).asUInt
+        io.exc := res.map(_._2).flatten
+      }
+    }}
+  } else {
+    val s1_valid = RegNext(io.valid, false.B)
+    val fma = Module(new SegmentedMulAddFNPipe(depth-2))
+    fma.io.validin      := s1_valid
+    fma.io.op           := Mux(s1_valid, s1_op, 0.U)
+    fma.io.roundingMode := Mux(s1_valid, s1_frm, 0.U)
+    fma.io.detectTininess := hardfloat.consts.tininess_afterRounding
+
+    fma.io.da := (0 until 1).map(i => RegEnable(da(i), io.valid))
+    fma.io.db := (0 until 1).map(i => RegEnable(Mux(io.addsub, 1.U << (FType.D.ieeeWidth - 1), db(i)), io.valid))
+    fma.io.dc := (0 until 1).map(i => RegEnable(Mux(io.mul, (da(i) ^ db(i)) & (1.U << FType.D.ieeeWidth), dc(i)), io.valid))
+
+    fma.io.sa := (0 until 2).map(i => RegEnable(sa(i), io.valid))
+    fma.io.sb := (0 until 2).map(i => RegEnable(Mux(io.addsub, 1.U << (FType.S.ieeeWidth - 1), sb(i)), io.valid))
+    fma.io.sc := (0 until 2).map(i => RegEnable(Mux(io.mul, (sa(i) ^ sb(i)) & (1.U << FType.S.ieeeWidth), sc(i)), io.valid))
+
+    fma.io.ha := (0 until 4).map(i => RegEnable(ha(i), io.valid))
+    fma.io.hb := (0 until 4).map(i => RegEnable(Mux(io.addsub, 1.U << (FType.H.ieeeWidth - 1), hb(i)), io.valid))
+    fma.io.hc := (0 until 4).map(i => RegEnable(Mux(io.mul, (ha(i) ^ hb(i)) & (1.U << FType.H.ieeeWidth), hc(i)), io.valid))
+
+    io.out := Pipe(fma.io.validout, FType.D.ieee(fma.io.out), depth-4).bits
+    io.exc := Pipe(fma.io.validout, fma.io.exceptionFlags, depth-4).bits
+  }
+}
+
+class SegmentedMulAddFNPipe(latency: Int) extends Module {
+  override def desiredName = s"SegmentedMulAddRecFNPipe_l${latency}"
+  require (latency <= 2)
+  
+  val io = IO(new Bundle {
+    val validin = Input(Bool())
+    val op = Input(Bits(2.W))
+    val da = Input(Vec(1, Bits(65.W)))
+    val db = Input(Vec(1, Bits(65.W)))
+    val dc = Input(Vec(1, Bits(65.W)))
+    val sa = Input(Vec(2, Bits(33.W)))
+    val sb = Input(Vec(2, Bits(33.W)))
+    val sc = Input(Vec(2, Bits(33.W)))
+    val ha = Input(Vec(4, Bits(17.W)))
+    val hb = Input(Vec(4, Bits(17.W)))
+    val hc = Input(Vec(4, Bits(17.W)))
+    val eew = Input(Bits(2.W))
+    val roundingMode = Input(UInt(3.W))
+    val detectTininess = Input(UInt(1.W))
+    val out = Output(Bits(68.W))
+    val exceptionFlags = Output(Bits(5.W))
+    val validout = Output(Bool())
+    val debug = Output(Bits(256.W))
+  })
+
+  // Rearrangement
+
+  val a_sign = Wire(Bits(4.W))
+  val a_exp = Wire(Bits(30.W))
+  val a_sig = Wire(Bits(56.W))
+  val b_sign = Wire(Bits(4.W))
+  val b_exp = Wire(Bits(30.W))
+  val b_sig = Wire(Bits(56.W))
+  val c_sign = Wire(Bits(4.W))
+  val c_exp = Wire(Bits(30.W))
+  val c_sig = Wire(Bits(56.W))
+  
+  a_sign := DontCare
+  a_exp := DontCare
+  a_sig := DontCare
+  b_sign := DontCare
+  b_exp := DontCare
+  b_sig := DontCare
+  c_sign := DontCare
+  c_exp := DontCare
+  c_sig := DontCare
+
+  val test = Seq(
+    (io.da, io.sa, io.ha, a_sign, a_exp, a_sig),
+    (io.db, io.sb, io.hb, b_sign, b_exp, b_sig),
+    (io.dc, io.sc, io.hc, c_sign, c_exp, c_sig),
+  ).foreach { case (dx, sx, hx, sign, exp, sig) => {
+    when (io.eew === 3.U) {
+      sign := Cat(0.asUInt(3.W), dx(0)(64))
+      exp := Cat(0.asUInt(18.W), dx(0)(63, 52))
+      sig := Cat(1.asUInt(1.W), dx(0)(51, 0))
+    } .elsewhen (io.eew === 2.U) {
+      sign := Cat(0.asUInt(1.W), sx(1)(32), 0.asUInt(1.W), sx(0)(32))
+      exp := Cat(0.asUInt(10.W), sx(1)(31, 23), 0.asUInt(2.W), sx(0)(31, 23))
+      sig := Cat(1.asUInt(5.W), sx(1)(22, 0), 1.asUInt(5.W), sx(0)(22, 0))
+    } .elsewhen (io.eew === 1.U) {
+      sign := Cat(hx(3)(16), hx(2)(16), hx(1)(16), hx(0)(16))
+      exp := Cat(
+        hx(3)(15, 10), 0.asUInt(2.W),
+        hx(2)(15, 10), 0.asUInt(2.W),
+        hx(1)(15, 10), 0.asUInt(2.W),
+        hx(0)(15, 10)
+      )
+      sig := Cat(
+        1.asUInt(4.W), hx(3)(9, 0),
+        1.asUInt(4.W), hx(2)(9, 0),
+        1.asUInt(4.W), hx(1)(9, 0),
+        1.asUInt(4.W), hx(0)(9, 0)
+      )
     }
-    when (out_eew_pipe.bits === log2Ceil(ftype.ieeeWidth >> 3).U) {
-      io.out := res.map(_._1).asUInt
-      io.exc := res.map(_._2).flatten
-    }
-  }}
+  }} // TODO: Override sig for C
+
+  // TODO: Exponent Processor
+
+  val exp_ab = a_exp + b_exp
+
+  // Mantissa Multiplier
+
+  val sig_mul = Module(new MultiplierArray(4, 14, false, 1))
+  sig_mul.io.in1_signed := DontCare
+  sig_mul.io.in2_signed := DontCare
+  sig_mul.io.in1 := a_sig
+  sig_mul.io.in2 := b_sig
+  sig_mul.io.eew := io.eew
+  
+  // Misc.
+
+  val sign_ab = a_sign ^ b_sign ^ Fill(4, io.op(1))
+
+  io.debug := sig_mul.io.out
+  
+  io.out := DontCare
+  io.exceptionFlags := DontCare
+  io.validout := DontCare
 }
 
 trait FMAFactory extends FunctionalUnitFactory {
@@ -131,7 +256,7 @@ trait FMAFactory extends FunctionalUnitFactory {
   ).map(_.pipelined(depth)).map(_.restrictSEW(1,2,3)).flatten
 }
 
-case class SIMDFPFMAFactory(depth: Int, elementWiseFP64: Boolean = false) extends FMAFactory {
+case class SIMDFPFMAFactory(depth: Int, elementWiseFP64: Boolean = false, segmented: Boolean = false) extends FMAFactory {
   def insns = if (elementWiseFP64) {
     base_insns.map { insn =>
       if (insn.lookup(SEW).value == 3 || (insn.lookup(SEW).value == 2 && insn.lookup(Wide2VD).value == 1)) {
@@ -143,10 +268,10 @@ case class SIMDFPFMAFactory(depth: Int, elementWiseFP64: Boolean = false) extend
   } else {
     base_insns
   }
-  def generate(implicit p: Parameters) = new FPFMAPipe(depth, elementWiseFP64)(p)
+  def generate(implicit p: Parameters) = new FPFMAPipe(depth, elementWiseFP64, segmented)(p)
 }
 
-class FPFMAPipe(depth: Int, elementwiseFP64: Boolean)(implicit p: Parameters) extends PipelinedFunctionalUnit(depth)(p) with HasFPUParameters {
+class FPFMAPipe(depth: Int, elementwiseFP64: Boolean, segmented: Boolean)(implicit p: Parameters) extends PipelinedFunctionalUnit(depth)(p) with HasFPUParameters {
   val supported_insns = SIMDFPFMAFactory(depth, elementwiseFP64).insns
 
   io.stall := false.B
@@ -174,7 +299,7 @@ class FPFMAPipe(depth: Int, elementwiseFP64: Boolean)(implicit p: Parameters) ex
   val vec_rvd = io.pipe(0).bits.rvd_data.asTypeOf(Vec(nTandemFMA, UInt(64.W)))
 
   val pipe_out = (0 until nTandemFMA).map { i =>
-    val fma_pipe = Module(new TandemFMAPipe(depth, i == 0 || !elementwiseFP64))
+    val fma_pipe = Module(new TandemFMAPipe(depth, i == 0 || !elementwiseFP64, segmented))
     val widening_vs1_bits = Mux(vd_eew === 3.U,
       0.U(32.W) ## extractElem(io.pipe(0).bits.rvs1_data, 2.U, eidx + i.U)(31,0),
       Cat(
