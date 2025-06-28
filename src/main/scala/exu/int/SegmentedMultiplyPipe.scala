@@ -53,15 +53,15 @@ class SegmentedMultiplyPipe(depth: Int)(implicit p: Parameters) extends Pipeline
   val mul_in1 = in_vs1
   val mul_in2 = Mux(ctrl.bool(MULSwapVdV2), in_vd, in_vs2)
 
-  val multipliers = Seq.fill(dLenB >> 3)(Module(new MultiplyBlock))
+  val multipliers = Seq.fill(dLenB >> 3)(Module(new MultiplierArray(8)))
   for (i <- 0 until (dLenB >> 3)) {
     multipliers(i).io.in1_signed := ctrl.bool(MULSign1)
     multipliers(i).io.in2_signed := ctrl.bool(MULSign2)
     multipliers(i).io.eew        := io.pipe(0).bits.rvs1_eew
-    multipliers(i).io.in1        := mul_in1.asTypeOf(Vec(dLenB >> 3, UInt(64.W)))(i)
-    multipliers(i).io.in2        := mul_in2.asTypeOf(Vec(dLenB >> 3, UInt(64.W)))(i)
+    multipliers(i).io.in1        := mul_in1.asTypeOf(Vec(dLenB >> 3, UInt(64.W)))(i).asTypeOf(Vec(8, UInt(8.W)))
+    multipliers(i).io.in2        := mul_in2.asTypeOf(Vec(dLenB >> 3, UInt(64.W)))(i).asTypeOf(Vec(8, UInt(8.W)))
   }
-  val mul_out_comb = VecInit(multipliers.map(_.io.out_data)).asUInt
+  val mul_out_comb = VecInit(multipliers.map(_.io.out)).asUInt
 
   ////////////////////////////////////////////////////////////////////////////////////////////
   // Pipeline Stages Before Adder Array
@@ -88,7 +88,7 @@ class SegmentedMultiplyPipe(depth: Int)(implicit p: Parameters) extends Pipeline
   })(in_eew_pipe)
   val half_sel = (io.pipe(depth-2).bits.eidx >> (dLenOffBits.U - out_eew_pipe))(0)
   val wide = Mux(half_sel, mul_out >> dLen, mul_out)(dLen-1,0)
-
+  
   val (smul_clipped, smul_sat) = {
     val smul_arr = Module(new VectorSMul)
     smul_arr.io.mul_in := mul_out
@@ -97,10 +97,10 @@ class SegmentedMultiplyPipe(depth: Int)(implicit p: Parameters) extends Pipeline
     (smul_arr.io.clipped, smul_arr.io.sat)
   } 
 
-  val adder_arr = Module(new AdderArray(dLenB))
+  val adder_arr = Module(new AdderArray(dLenB, no_rm=true, no_incr=true))
   adder_arr.io.in1 := Mux(ctrl_wmul, wide, lo).asTypeOf(Vec(dLenB, UInt(8.W)))
   adder_arr.io.in2 := Mux(ctrl_MULAccumulate, Mux(ctrl_MULSwapVdV2, in_vs2_pipe, in_vd_pipe), 0.U(dLen.W)).asTypeOf(Vec(dLenB, UInt(8.W)))
-  adder_arr.io.incr := VecInit.fill(dLenB)(false.B)
+  adder_arr.io.incr := DontCare
   adder_arr.io.mask_carry := 0.U
   adder_arr.io.signed := DontCare
   adder_arr.io.eew := out_eew_pipe
