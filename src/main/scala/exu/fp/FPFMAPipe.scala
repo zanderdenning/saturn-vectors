@@ -120,59 +120,70 @@ class TandemFMAPipe(depth: Int, buildFP64: Boolean, segmented: Boolean)(implicit
     fma.io.roundingMode := Mux(s1_valid, s1_frm, 0.U)
     fma.io.detectTininess := hardfloat.consts.tininess_afterRounding
 
-    fma.io.da := (0 until 1).map(i => RegEnable(da(i), io.valid))
-    fma.io.db := (0 until 1).map(i => RegEnable(Mux(io.addsub, 1.U << (FType.D.ieeeWidth - 1), db(i)), io.valid))
-    fma.io.dc := (0 until 1).map(i => RegEnable(Mux(io.mul, (da(i) ^ db(i)) & (1.U << FType.D.ieeeWidth), dc(i)), io.valid))
+    fma.io.a := DontCare
+    fma.io.b := DontCare
+    fma.io.c := DontCare
 
-    fma.io.sa := (0 until 2).map(i => RegEnable(sa(i), io.valid))
-    fma.io.sb := (0 until 2).map(i => RegEnable(Mux(io.addsub, 1.U << (FType.S.ieeeWidth - 1), sb(i)), io.valid))
-    fma.io.sc := (0 until 2).map(i => RegEnable(Mux(io.mul, (sa(i) ^ sb(i)) & (1.U << FType.S.ieeeWidth), sc(i)), io.valid))
-
-    fma.io.ha := (0 until 4).map(i => RegEnable(ha(i), io.valid))
-    fma.io.hb := (0 until 4).map(i => RegEnable(Mux(io.addsub, 1.U << (FType.H.ieeeWidth - 1), hb(i)), io.valid))
-    fma.io.hc := (0 until 4).map(i => RegEnable(Mux(io.mul, (ha(i) ^ hb(i)) & (1.U << FType.H.ieeeWidth), hc(i)), io.valid))
+    when (io.out_eew === 3.U) {
+      fma.io.a := VecInit.tabulate(1){i => RegEnable(da(i), io.valid)}.asUInt
+      fma.io.b := VecInit.tabulate(1){i => RegEnable(Mux(io.addsub, 1.U << (FType.D.ieeeWidth - 1), db(i)), io.valid)}.asUInt
+      fma.io.c := VecInit.tabulate(1){i => RegEnable(Mux(io.mul, (da(i) ^ db(i)) & (1.U << FType.D.ieeeWidth), dc(i)), io.valid)}.asUInt
+    } .elsewhen (io.out_eew === 2.U) {
+      fma.io.a := VecInit.tabulate(2){i => RegEnable(sa(i), io.valid)}.asUInt
+      fma.io.b := VecInit.tabulate(2){i => RegEnable(Mux(io.addsub, 1.U << (FType.S.ieeeWidth - 1), sb(i)), io.valid)}.asUInt
+      fma.io.c := VecInit.tabulate(2){i => RegEnable(Mux(io.mul, (sa(i) ^ sb(i)) & (1.U << FType.S.ieeeWidth), sc(i)), io.valid)}.asUInt
+    } .elsewhen (io.out_eew === 1.U) {
+      fma.io.a := VecInit.tabulate(4){i => RegEnable(ha(i), io.valid)}.asUInt
+      fma.io.b := VecInit.tabulate(4){i => RegEnable(Mux(io.addsub, 1.U << (FType.H.ieeeWidth - 1), hb(i)), io.valid)}.asUInt
+      fma.io.c := VecInit.tabulate(4){i => RegEnable(Mux(io.mul, (ha(i) ^ hb(i)) & (1.U << FType.H.ieeeWidth), hc(i)), io.valid)}.asUInt
+    }    
 
     io.out := Pipe(fma.io.validout, FType.D.ieee(fma.io.out), depth-4).bits
     io.exc := Pipe(fma.io.validout, fma.io.exceptionFlags, depth-4).bits
   }
 }
 
-class SegmentedMulAddFNPipe(latency: Int) extends Module {
+class SegmentedMulAddFNPipe(latency: Int, supported_ftypes: Seq[FType] = Seq(FType.H, FType.S, FType.D), start_eew: Int = 1) extends Module {
   override def desiredName = s"SegmentedMulAddRecFNPipe_l${latency}"
   require (latency <= 2)
-  
+
+  val elements_count = 1 << (supported_ftypes.size - 1)
+  val input_size = supported_ftypes.zipWithIndex.map{ case (ftype, idx) => ftype.recodedWidth * (1 << (supported_ftypes.size - idx - 1)) }.max
+  val elements_size = input_size / elements_count
+  val min_exp = supported_ftypes.minBy(_.exp).exp
+  val max_sig = supported_ftypes.maxBy(_.sig).sig
+
   val io = IO(new Bundle {
     val validin = Input(Bool())
     val op = Input(Bits(2.W))
-    val da = Input(Vec(1, Bits(65.W)))
-    val db = Input(Vec(1, Bits(65.W)))
-    val dc = Input(Vec(1, Bits(65.W)))
-    val sa = Input(Vec(2, Bits(33.W)))
-    val sb = Input(Vec(2, Bits(33.W)))
-    val sc = Input(Vec(2, Bits(33.W)))
-    val ha = Input(Vec(4, Bits(17.W)))
-    val hb = Input(Vec(4, Bits(17.W)))
-    val hc = Input(Vec(4, Bits(17.W)))
-    val eew = Input(Bits(2.W))
+    val a = Input(Bits(input_size.W))
+    val b = Input(Bits(input_size.W))
+    val c = Input(Bits(input_size.W))
+    val eew = Input(Bits((log2Ceil(supported_ftypes.size + start_eew)).W))
     val roundingMode = Input(UInt(3.W))
     val detectTininess = Input(UInt(1.W))
-    val out = Output(Bits(68.W))
+    val out = Output(Bits(input_size.W))
     val exceptionFlags = Output(Bits(5.W))
     val validout = Output(Bool())
     val debug = Output(Bits(256.W))
   })
+  
+  val shifted_eew = io.eew - 1.U
 
   // Rearrangement
 
-  val a_sign = Wire(Bits(4.W))
-  val a_exp = Wire(Bits(30.W))
-  val a_sig = Wire(Bits(56.W))
-  val b_sign = Wire(Bits(4.W))
-  val b_exp = Wire(Bits(30.W))
-  val b_sig = Wire(Bits(56.W))
-  val c_sign = Wire(Bits(4.W))
-  val c_exp = Wire(Bits(30.W))
-  val c_sig = Wire(Bits(56.W))
+  val exp_array_width = (min_exp + 2) * elements_count
+  val sig_array_width = ((max_sig - 1) / elements_count + 1) * elements_count
+
+  val a_sign = Wire(Bits(elements_count.W))
+  val a_exp = Wire(Bits(exp_array_width.W))
+  val a_sig = Wire(Bits(sig_array_width.W))
+  val b_sign = Wire(Bits(elements_count.W))
+  val b_exp = Wire(Bits(exp_array_width.W))
+  val b_sig = Wire(Bits(sig_array_width.W))
+  val c_sign = Wire(Bits(elements_count.W))
+  val c_exp = Wire(Bits(exp_array_width.W))
+  val c_sig = Wire(Bits(sig_array_width.W))
   
   a_sign := DontCare
   a_exp := DontCare
@@ -185,38 +196,70 @@ class SegmentedMulAddFNPipe(latency: Int) extends Module {
   c_sig := DontCare
 
   val test = Seq(
-    (io.da, io.sa, io.ha, a_sign, a_exp, a_sig),
-    (io.db, io.sb, io.hb, b_sign, b_exp, b_sig),
-    (io.dc, io.sc, io.hc, c_sign, c_exp, c_sig),
-  ).foreach { case (dx, sx, hx, sign, exp, sig) => {
-    when (io.eew === 3.U) {
-      sign := Cat(0.asUInt(3.W), dx(0)(64))
-      exp := Cat(0.asUInt(18.W), dx(0)(63, 52))
-      sig := Cat(1.asUInt(1.W), dx(0)(51, 0))
-    } .elsewhen (io.eew === 2.U) {
-      sign := Cat(0.asUInt(1.W), sx(1)(32), 0.asUInt(1.W), sx(0)(32))
-      exp := Cat(0.asUInt(10.W), sx(1)(31, 23), 0.asUInt(2.W), sx(0)(31, 23))
-      sig := Cat(1.asUInt(5.W), sx(1)(22, 0), 1.asUInt(5.W), sx(0)(22, 0))
-    } .elsewhen (io.eew === 1.U) {
-      sign := Cat(hx(3)(16), hx(2)(16), hx(1)(16), hx(0)(16))
-      exp := Cat(
-        hx(3)(15, 10), 0.asUInt(2.W),
-        hx(2)(15, 10), 0.asUInt(2.W),
-        hx(1)(15, 10), 0.asUInt(2.W),
-        hx(0)(15, 10)
-      )
-      sig := Cat(
-        1.asUInt(4.W), hx(3)(9, 0),
-        1.asUInt(4.W), hx(2)(9, 0),
-        1.asUInt(4.W), hx(1)(9, 0),
-        1.asUInt(4.W), hx(0)(9, 0)
-      )
+    (io.a, a_sign, a_exp, a_sig),
+    (io.b, b_sign, b_exp, b_sig),
+    (io.c, c_sign, c_exp, c_sig),
+  ).foreach { case (in, sign, exp, sig) => {
+    val raw = (0 until supported_ftypes.size).zipWithIndex.map { case (ftype, idx) => {
+      VecInit.tabulate(elements_count >> (supported_ftypes.size - idx)) { i => 
+        hardfloat.rawFloatFromRecFN(supported_ftypes(i).exp, supported_ftypes(i).sig, in((((i + 1) * elements_size) << idx) - 1, (i * elements_size) << idx))
+      }}
     }
+    supported_ftypes.zipWithIndex.foreach { case (ftype, idx) => {
+      val element_width = 1 << idx
+      when (io.eew === (idx + start_eew).U) {
+        sign := Cat(0.U((elements_count - (elements_count >> idx)).W), VecInit.tabulate(elements_count >> idx){ i => raw(idx)(i).sign }.asUInt)
+        exp := VecInit.tabulate(elements_count >> idx) { i =>
+          Cat(
+            0.asUInt(((exp_array_width >> idx) - ftype.exp).W),
+            raw(idx)(i).sExp(ftype.exp - 1, 0)
+          )
+        }.asUInt
+        sig := VecInit.tabulate(elements_count >> idx) { i =>
+          Cat(
+            0.asUInt(((sig_array_width >> idx) - ftype.sig - 1).W),
+            1.asUInt(1.W),
+            in(ftype.sig - 1, 0)) // sExp is a weird size...
+        }.asUInt
+      }
+    }}
+    // when (io.eew === 3.U) {
+    //   sign := Cat(0.asUInt(3.W), dx(0)(64))
+    //   exp := Cat(0.asUInt(18.W), dx(0)(63, 52))
+    //   sig := Cat(1.asUInt(1.W), dx(0)(51, 0))
+    // } .elsewhen (io.eew === 2.U) {
+    //   sign := Cat(0.asUInt(1.W), sx(1)(32), 0.asUInt(1.W), sx(0)(32))
+    //   exp := Cat(0.asUInt(10.W), sx(1)(31, 23), 0.asUInt(2.W), sx(0)(31, 23))
+    //   sig := Cat(1.asUInt(5.W), sx(1)(22, 0), 1.asUInt(5.W), sx(0)(22, 0))
+    // } .elsewhen (io.eew === 1.U) {
+    //   sign := Cat(hx(3)(16), hx(2)(16), hx(1)(16), hx(0)(16))
+    //   exp := Cat(
+    //     hx(3)(15, 10), 0.asUInt(2.W),
+    //     hx(2)(15, 10), 0.asUInt(2.W),
+    //     hx(1)(15, 10), 0.asUInt(2.W),
+    //     hx(0)(15, 10)
+    //   )
+    //   sig := Cat(
+    //     1.asUInt(4.W), hx(3)(9, 0),
+    //     1.asUInt(4.W), hx(2)(9, 0),
+    //     1.asUInt(4.W), hx(1)(9, 0),
+    //     1.asUInt(4.W), hx(0)(9, 0)
+    //   )
+    // }
   }} // TODO: Override sig for C
+
+  val sign_ab = a_sign ^ b_sign ^ Fill(elements_count, io.op(1))
 
   // TODO: Exponent Processor
 
-  val exp_ab = a_exp + b_exp
+  val s_exp_ab = a_exp + b_exp + (0 until supported_ftypes.size).map(eew => {
+    val bias = (-(BigInt(1) << supported_ftypes(eew).exp) + supported_ftypes(eew).sig + 3).S(((exp_array_width / elements_count) << (eew - 1)).W)
+    Fill(elements_count >> (eew - 1), bias.asUInt)
+  })(shifted_eew)
+  val sub_mags = sign_ab ^ c_sign ^ Fill(elements_count, io.op(0))
+
+  // s_c_align_dist = s_exp_ab - 
+
 
   // Mantissa Multiplier
 
@@ -229,7 +272,6 @@ class SegmentedMulAddFNPipe(latency: Int) extends Module {
   
   // Misc.
 
-  val sign_ab = a_sign ^ b_sign ^ Fill(4, io.op(1))
 
   io.debug := sig_mul.io.out
   
